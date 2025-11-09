@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import { TrendApp } from "./TrendApp";
+import { GuardianApp } from "./GuardianApp";
 import { MakerApp } from "./MakerApp";
 import { OffsetMakerApp } from "./OffsetMakerApp";
 import { GridApp } from "./GridApp";
@@ -10,7 +11,7 @@ import { loadCopyrightFragments, verifyCopyrightIntegrity } from "../utils/copyr
 import { resolveExchangeId } from "../exchanges/create-adapter";
 
 interface StrategyOption {
-  id: "trend" | "maker" | "offset-maker" | "basis" | "grid";
+  id: "trend" | "guardian" | "maker" | "offset-maker" | "basis" | "grid";
   label: string;
   description: string;
   component: React.ComponentType<{ onExit: () => void }>;
@@ -22,6 +23,12 @@ const BASE_STRATEGIES: StrategyOption[] = [
     label: "趋势跟随策略 (SMA30)",
     description: "监控均线信号，自动进出场并维护止损/止盈",
     component: TrendApp,
+  },
+  {
+    id: "guardian",
+    label: "Guardian 防守策略",
+    description: "不主动开仓，只为现有仓位补挂/移动止损，防止裸奔",
+    component: GuardianApp,
   },
   {
     id: "maker",

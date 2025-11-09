@@ -118,6 +118,8 @@ const DEFAULT_TICKER_POLL_MS = 3000;
 const DEFAULT_KLINE_POLL_MS = 15000;
 const WS_HEARTBEAT_INTERVAL_MS = 5_000;
 const WS_STALE_TIMEOUT_MS = 20_000;
+const ACCOUNT_POLL_INTERVAL_MS = 5_000;
+const ACCOUNT_HTTP_EMPTY_CONFIRM_MS = 15_000;
 const POSITION_EPSILON = 1e-12;
 
 const RESOLUTION_MS: Record<string, number> = {
@@ -159,6 +161,8 @@ export class LighterGateway {
   private readonly apiKeyIndices: number[];
   private readonly environment: keyof typeof LIGHTER_HOSTS;
   private readonly pollers: Pollers = { ticker: undefined, klines: new Map() };
+  private accountPoller: ReturnType<typeof setInterval> | null = null;
+  private accountPollInFlight = false;
   private readonly klineCache = new Map<string, AsterKline[]>();
   private readonly accountEvent = createEvent<AsterAccountSnapshot>();
   private readonly ordersEvent = createEvent<AsterOrder[]>();
@@ -168,6 +172,8 @@ export class LighterGateway {
   private readonly auth = { token: null as string | null, expiresAt: 0 };
   private readonly l1Address: string | null;
   private loggedCreateOrderPayload = false;
+  private httpEmptySince: number | null = null;
+  private lastWsPositionUpdateAt = 0;
 
   private marketId: number | null = null;
   private priceDecimals: number | null = null;
@@ -419,19 +425,8 @@ export class LighterGateway {
           value: Number(this.signer.accountIndex),
         });
       }
-      if (details) {
-        this.accountDetails = details;
-        if (Object.prototype.hasOwnProperty.call(details, "positions")) {
-          const initialPositions = this.normalizePositions(details.positions);
-          if (initialPositions.length) {
-            this.replacePositions(initialPositions);
-          } else if (this.isEmptyPositionsPayload(details.positions)) {
-            this.positions = [];
-          }
-        }
-        this.emitAccount();
-      } else {
-        // Fallback: emit an empty account snapshot so strategies can proceed
+    if (!details) {
+      if (!this.accountDetails) {
         this.accountDetails = {
           account_index: Number(this.signer.accountIndex),
           status: 1,
@@ -441,9 +436,59 @@ export class LighterGateway {
         this.positions = [];
         this.emitAccount();
       }
+      return;
+    }
+    this.accountDetails = details;
+    this.applyHttpPositions(details);
+    this.emitAccount();
     } catch (error) {
       this.logger("refreshAccount", error);
     }
+  }
+
+  private applyHttpPositions(details: LighterAccountDetails): void {
+    if (!Object.prototype.hasOwnProperty.call(details, "positions")) {
+      return;
+    }
+    const normalized = this.normalizePositions(details.positions);
+    if (normalized.length) {
+      this.replacePositions(normalized);
+      this.recordHttpPositionUpdate();
+      this.httpEmptySince = null;
+      return;
+    }
+    if (!this.isEmptyPositionsPayload(details.positions)) {
+      return;
+    }
+    this.handleHttpEmptyPositions();
+  }
+
+  private handleHttpEmptyPositions(): void {
+    if (this.positions.length === 0) {
+      this.httpEmptySince = null;
+      return;
+    }
+    if (this.httpEmptySince == null) {
+      this.httpEmptySince = Date.now();
+      return;
+    }
+    const now = Date.now();
+    const sinceEmpty = now - this.httpEmptySince;
+    const sinceWs = now - this.lastWsPositionUpdateAt;
+    if (sinceEmpty >= ACCOUNT_HTTP_EMPTY_CONFIRM_MS && sinceWs >= ACCOUNT_HTTP_EMPTY_CONFIRM_MS) {
+      this.positions = [];
+      this.recordHttpPositionUpdate();
+      this.httpEmptySince = null;
+    }
+  }
+
+  private recordWsPositionUpdate(): void {
+    this.lastWsPositionUpdateAt = Date.now();
+    this.httpEmptySince = null;
+  }
+
+  private recordHttpPositionUpdate(): void {
+    this.httpEmptySince = null;
   }
 
   private async openWebSocket(): Promise<void> {
@@ -671,10 +716,14 @@ export class LighterGateway {
     if (Object.prototype.hasOwnProperty.call(message, "positions")) {
       const positionsObject = message.positions ?? {};
       const incoming = this.normalizePositions(positionsObject);
-      if (!incoming.length && this.isEmptyPositionsPayload(positionsObject)) {
-        this.positions = [];
-      } else if (incoming.length) {
+      if (incoming.length) {
         this.mergePositions(incoming);
+        this.recordWsPositionUpdate();
+      } else if (this.isEmptyPositionsPayload(positionsObject)) {
+        if (this.positions.length) {
+          this.positions = [];
+        }
+        this.recordWsPositionUpdate();
       }
     }
     this.emitAccount();
@@ -687,6 +736,7 @@ export class LighterGateway {
     const channelMarketId = this.extractMarketIdFromChannel(message.channel);
     if (position && Number.isFinite(Number(position.market_id))) {
       this.mergePositions([position]);
+      this.recordWsPositionUpdate();
     }
     if (Array.isArray(message.orders) && message.orders.length) {
       const marketId = Number(position?.market_id ?? channelMarketId ?? this.marketId ?? NaN);
@@ -694,6 +744,17 @@ export class LighterGateway {
     } else if (type === "subscribed/account_market" && channelMarketId != null) {
       this.clearOrdersForMarket(channelMarketId);
       this.emitOrders();
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(message, "position") &&
+      !position &&
+      this.isEmptyPositionsPayload(message.position) &&
+      channelMarketId != null &&
+      this.positions.length
+    ) {
+      const target = Number(channelMarketId);
+      this.positions = this.positions.filter((entry) => Number(entry.market_id) !== target);
+      this.recordWsPositionUpdate();
     }
     this.emitAccount();
   }
@@ -919,6 +980,20 @@ export class LighterGateway {
         this.refreshTicker().catch((error) => this.logger("ticker", error));
       }, this.tickerPollMs);
       void this.refreshTicker();
+    }
+
+    if (!this.accountPoller) {
+      const pollAccount = () => {
+        if (this.accountPollInFlight) return;
+        this.accountPollInFlight = true;
+        this.refreshAccountSnapshot()
+          .catch((error) => this.logger("accountPoll", error))
+          .finally(() => {
+            this.accountPollInFlight = false;
+          });
+      };
+      this.accountPoller = setInterval(pollAccount, ACCOUNT_POLL_INTERVAL_MS);
+      pollAccount();
     }
   }
 

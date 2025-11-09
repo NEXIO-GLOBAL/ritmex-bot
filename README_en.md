@@ -1,6 +1,6 @@
 # ritmex-bot
 
-A Bun-powered multi-exchange perpetuals workstation that ships an SMA30 trend engine and two market-making modes. It offers instant restarts, realtime market data, structured logging, and an Ink-based CLI dashboard.
+A Bun-powered multi-exchange perpetuals workstation that ships an SMA30 trend engine, a Guardian stop sentinel, and two market-making modes. It offers instant restarts, realtime market data, structured logging, and an Ink-based CLI dashboard.
 
 * [Aster referral (30% fee discount)](https://www.asterdex.com/en/referral/4665f3)
 * [Binance referral link](https://www.binance.com/join?ref=KNKCA9XC)
@@ -17,6 +17,7 @@ A Bun-powered multi-exchange perpetuals workstation that ships an SMA30 trend en
 ## Highlights
 - **Live data & risk sync** via websockets with REST fallbacks and full reconciliation on restart.
 - **Trend strategy** featuring SMA30 entries, fixed stop loss, trailing stop, Bollinger bandwidth gate, and profit-lock stepping.
+- **Guardian strategy** that never opens trades but mirrors your live exposure, ensuring every position has a synced stop loss and trailing stop.
 - **Market-making loop** with dual-sided quote chasing, loss caps, and automatic order healing.
 - **Modular architecture** decoupling engines, exchange adapters, and the Ink CLI for easy venue or strategy extensions.
 

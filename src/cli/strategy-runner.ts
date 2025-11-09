@@ -5,6 +5,7 @@ import { buildAdapterFromEnv } from "../exchanges/resolve-from-env";
 import { MakerEngine, type MakerEngineSnapshot } from "../strategy/maker-engine";
 import { OffsetMakerEngine, type OffsetMakerEngineSnapshot } from "../strategy/offset-maker-engine";
 import { TrendEngine, type TrendEngineSnapshot } from "../strategy/trend-engine";
+import { GuardianEngine, type GuardianEngineSnapshot } from "../strategy/guardian-engine";
 import { BasisArbEngine, type BasisArbSnapshot } from "../strategy/basis-arb-engine";
 import { GridEngine, type GridEngineSnapshot } from "../strategy/grid-engine";
 import { extractMessage } from "../utils/errors";
@@ -18,6 +19,7 @@ type StrategyRunner = (options: RunnerOptions) => Promise<void>;
 
 export const STRATEGY_LABELS: Record<StrategyId, string> = {
   trend: "Trend Following",
+  guardian: "Guardian",
   maker: "Maker",
   "offset-maker": "Offset Maker",
   basis: "Basis Arbitrage",
@@ -40,6 +42,19 @@ const STRATEGY_FACTORIES: Record<StrategyId, StrategyRunner> = {
     await runEngine({
       engine,
       strategy: "trend",
+      silent: opts.silent,
+      getSnapshot: () => engine.getSnapshot(),
+      onUpdate: (emitter) => engine.on("update", emitter),
+      offUpdate: (emitter) => engine.off("update", emitter),
+    });
+  },
+  guardian: async (opts) => {
+    const config = tradingConfig;
+    const adapter = createAdapterOrThrow(config.symbol);
+    const engine = new GuardianEngine(config, adapter);
+    await runEngine({
+      engine,
+      strategy: "guardian",
       silent: opts.silent,
       getSnapshot: () => engine.getSnapshot(),
       onUpdate: (emitter) => engine.on("update", emitter),
@@ -116,7 +131,13 @@ interface EngineHarness<TSnapshot> {
 }
 
 async function runEngine<
-  TSnapshot extends TrendEngineSnapshot | MakerEngineSnapshot | OffsetMakerEngineSnapshot | BasisArbSnapshot | GridEngineSnapshot
+  TSnapshot extends
+    | TrendEngineSnapshot
+    | GuardianEngineSnapshot
+    | MakerEngineSnapshot
+    | OffsetMakerEngineSnapshot
+    | BasisArbSnapshot
+    | GridEngineSnapshot
 >(
   harness: EngineHarness<TSnapshot>
 ): Promise<void> {
