@@ -122,6 +122,7 @@ const WS_HEARTBEAT_INTERVAL_MS = 5_000;
 const WS_STALE_TIMEOUT_MS = 20_000;
 const FEED_STALE_TIMEOUT_MS = 8_000;
 const STALE_CHECK_INTERVAL_MS = 2_000;
+const POSITION_HTTP_MAX_STALE_MS = 60_000;
 const ACCOUNT_POLL_INTERVAL_MS = 5_000;
 const POSITION_EPSILON = 1e-12;
 
@@ -184,6 +185,7 @@ export class LighterGateway {
   private loggedCreateOrderPayload = false;
   private readonly logTxInfo: boolean;
   private lastWsPositionUpdateAt = 0;
+  private readonly lastWsPositionByMarket = new Map<number, number>();
   private httpPositionsEmptyLogged = false;
 
   private marketId: number | null = null;
@@ -479,12 +481,40 @@ export class LighterGateway {
         this.logger("accountPoll", "HTTP positions payload empty, retaining existing positions until WS confirms");
         this.httpPositionsEmptyLogged = true;
       }
+      this.pruneStalePositionsFromHttp();
     }
   }
 
   private recordWsPositionUpdate(): void {
     this.lastWsPositionUpdateAt = Date.now();
     this.httpPositionsEmptyLogged = false;
+  }
+
+  private markWsPositionForMarket(marketId: number): void {
+    if (!Number.isFinite(marketId)) return;
+    this.lastWsPositionByMarket.set(marketId, Date.now());
+  }
+
+  private pruneStalePositionsFromHttp(): void {
+    if (!this.positions.length) return;
+    const now = Date.now();
+    const remaining: LighterPosition[] = [];
+    let removed = false;
+    for (const pos of this.positions) {
+      const marketId = Number(pos.market_id);
+      const lastWs = this.lastWsPositionByMarket.get(marketId) ?? 0;
+      if (Number.isFinite(marketId) && lastWs && now - lastWs > POSITION_HTTP_MAX_STALE_MS) {
+        this.lastWsPositionByMarket.delete(marketId);
+        removed = true;
+        continue;
+      }
+      remaining.push(pos);
+    }
+    if (removed) {
+      this.logger("accountPoll", "Pruned stale positions based on HTTP inactivity");
+      this.positions = remaining;
+      this.recordWsPositionUpdate();
+    }
   }
 
   private async openWebSocket(): Promise<void> {
@@ -749,6 +779,7 @@ export class LighterGateway {
     const channelMarketId = this.extractMarketIdFromChannel(message.channel);
     if (position && Number.isFinite(Number(position.market_id))) {
       this.mergePositions([position]);
+      this.markWsPositionForMarket(Number(position.market_id));
       this.recordWsPositionUpdate();
     }
     if (Array.isArray(message.orders) && message.orders.length) {
@@ -762,6 +793,7 @@ export class LighterGateway {
       const target = Number(position.market_id ?? channelMarketId);
       if (Number.isFinite(target)) {
         this.positions = this.positions.filter((entry) => Number(entry.market_id) !== target);
+        this.lastWsPositionByMarket.delete(target);
         this.recordWsPositionUpdate();
       }
     }
@@ -805,8 +837,10 @@ export class LighterGateway {
       if (!Number.isFinite(marketId)) continue;
       if (this.shouldRemovePosition(update)) {
         byMarket.delete(marketId);
+        this.lastWsPositionByMarket.delete(marketId);
       } else {
         byMarket.set(marketId, update);
+        this.markWsPositionForMarket(marketId);
       }
     }
     this.positions = Array.from(byMarket.values());
@@ -815,10 +849,19 @@ export class LighterGateway {
   private replacePositions(positions: LighterPosition[]): void {
     if (!positions.length) {
       this.positions = [];
+      this.lastWsPositionByMarket.clear();
       return;
     }
     const filtered = this.filterPositions(positions);
     this.positions = filtered;
+    const now = Date.now();
+    this.lastWsPositionByMarket.clear();
+    for (const pos of filtered) {
+      const marketId = Number(pos.market_id);
+      if (Number.isFinite(marketId)) {
+        this.lastWsPositionByMarket.set(marketId, now);
+      }
+    }
   }
 
   private filterPositions(positions: LighterPosition[]): LighterPosition[] {
@@ -996,6 +1039,7 @@ export class LighterGateway {
   private markDepthUpdate(): void {
     this.lastDepthUpdateAt = Date.now();
     if (this.staleReason && this.staleReason.startsWith("depth")) {
+      this.logger("ws:stale:recovered", this.staleReason);
       this.staleReason = null;
     }
   }
@@ -1198,6 +1242,7 @@ export class LighterGateway {
       bidPrice: bestBid != null ? bestBid.toString() : undefined,
       askPrice: bestAsk != null ? bestAsk.toString() : undefined,
       priceChange: bestBid != null && bestAsk != null ? (bestAsk - bestBid).toString() : undefined,
+      markPrice: last.toString(),
       priceChangePercent: undefined,
       weightedAvgPrice: undefined,
       lastQty: undefined,
@@ -1314,13 +1359,15 @@ export class LighterGateway {
 function mergeLevels(existing: LighterOrderBookLevel[], updates: LighterOrderBookLevel[]): LighterOrderBookLevel[] {
   const map = new Map<string, string>();
   for (const level of existing) {
-    map.set(level.price, level.size);
+    const key = normalizePriceKey(level.price);
+    map.set(key, normalizeSizeValue(level.size));
   }
   for (const update of updates) {
+    const key = normalizePriceKey(update.price);
     if (Number(update.size) <= 0) {
-      map.delete(update.price);
+      map.delete(key);
     } else {
-      map.set(update.price, update.size);
+      map.set(key, normalizeSizeValue(update.size));
     }
   }
   return Array.from(map.entries()).map(([price, size]) => ({ price, size } as LighterOrderBookLevel));
@@ -1347,12 +1394,15 @@ function normalizeLevels(raw: Array<LighterOrderBookLevel | [string | number, st
   return raw
     .map((entry) => {
       if (Array.isArray(entry)) {
-        const price = String(entry[0]);
-        const size = String(entry[1]);
+        const price = normalizePriceKey(entry[0] as string | number);
+        const size = normalizeSizeValue(entry[1]);
         return { price, size } as LighterOrderBookLevel;
       }
       const obj = entry as LighterOrderBookLevel;
-      return { price: String(obj.price), size: String(obj.size) } as LighterOrderBookLevel;
+      return {
+        price: normalizePriceKey(obj.price),
+        size: normalizeSizeValue(obj.size),
+      } as LighterOrderBookLevel;
     })
     .filter((lvl) => lvl.price != null && lvl.size != null);
 }
@@ -1371,6 +1421,26 @@ function sortAndTrimLevels(
     return side === "bid" ? pb - pa : pa - pb;
   });
   return list.slice(0, Math.max(1, limit));
+}
+
+function normalizePriceKey(value: string | number | undefined): string {
+  if (value == null) return "0";
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return String(value).trim();
+  }
+  const fixed = num.toFixed(12);
+  return fixed.replace(/\.?0+$/, "") || "0";
+}
+
+function normalizeSizeValue(value: string | number | undefined): string {
+  if (value == null) return "0";
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return String(value).trim();
+  }
+  if (Math.abs(num) < 1e-12) return "0";
+  return num.toString();
 }
 
 function mapOrderType(type: OrderType): number {
