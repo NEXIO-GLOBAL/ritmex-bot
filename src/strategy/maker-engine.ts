@@ -41,6 +41,7 @@ export interface MakerEngineSnapshot {
   topBid: number | null;
   topAsk: number | null;
   spread: number | null;
+  priceDecimals: number;
   position: PositionSnapshot;
   pnl: number;
   accountUnrealized: number;
@@ -599,6 +600,7 @@ export class MakerEngine {
       topBid: topBid,
       topAsk: topAsk,
       spread,
+      priceDecimals: this.getPriceDecimals(),
       position,
       pnl,
       accountUnrealized: this.accountUnrealized,

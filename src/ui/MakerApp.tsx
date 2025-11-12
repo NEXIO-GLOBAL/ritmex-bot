@@ -70,7 +70,10 @@ export function MakerApp({ onExit }: MakerAppProps) {
 
   const topBid = snapshot.topBid;
   const topAsk = snapshot.topAsk;
-  const spreadDisplay = snapshot.spread != null ? `${snapshot.spread.toFixed(4)} USDT` : "-";
+  const priceDigits = snapshot.priceDecimals ?? 2;
+  const spreadDigits = Math.max(priceDigits + 1, 4);
+  const spreadDisplay =
+    snapshot.spread != null ? `${formatNumber(snapshot.spread, spreadDigits)} USDT` : "-";
   const hasPosition = Math.abs(snapshot.position.positionAmt) > 1e-5;
   const sortedOrders = [...snapshot.openOrders].sort((a, b) => (Number(b.updateTime ?? 0) - Number(a.updateTime ?? 0)) || Number(b.orderId) - Number(a.orderId));
   const openOrderRows = sortedOrders.slice(0, 8).map((order) => ({
@@ -121,7 +124,7 @@ export function MakerApp({ onExit }: MakerAppProps) {
       <Box flexDirection="column" marginBottom={1}>
         <Text color="cyanBright">Maker Strategy Dashboard</Text>
         <Text>
-          交易所: {exchangeName} ｜ 交易对: {snapshot.symbol} ｜ 买一价: {formatNumber(topBid, 2)} ｜ 卖一价: {formatNumber(topAsk, 2)} ｜ 点差: {spreadDisplay}
+          交易所: {exchangeName} ｜ 交易对: {snapshot.symbol} ｜ 买一价: {formatNumber(topBid, priceDigits)} ｜ 卖一价: {formatNumber(topAsk, priceDigits)} ｜ 点差: {spreadDisplay}
         </Text>
         <Text color="gray">状态: {snapshot.ready ? "实时运行" : "等待市场数据"} ｜ 按 Esc 返回策略选择</Text>
         <Text>
@@ -141,7 +144,7 @@ export function MakerApp({ onExit }: MakerAppProps) {
           {hasPosition ? (
             <>
               <Text>
-                方向: {snapshot.position.positionAmt > 0 ? "多" : "空"} ｜ 数量: {formatNumber(Math.abs(snapshot.position.positionAmt), 4)} ｜ 开仓价: {formatNumber(snapshot.position.entryPrice, 2)}
+                方向: {snapshot.position.positionAmt > 0 ? "多" : "空"} ｜ 数量: {formatNumber(Math.abs(snapshot.position.positionAmt), 4)} ｜ 开仓价: {formatNumber(snapshot.position.entryPrice, priceDigits)}
               </Text>
               <Text>
                 浮动盈亏: {formatNumber(snapshot.pnl, 4)} USDT ｜ 账户未实现盈亏: {formatNumber(snapshot.accountUnrealized, 4)} USDT

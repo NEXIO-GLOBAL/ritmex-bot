@@ -725,6 +725,7 @@ export class OffsetMakerEngine {
       topBid: topBid,
       topAsk: topAsk,
       spread,
+      priceDecimals: this.getPriceDecimals(),
       position,
       pnl,
       accountUnrealized: this.accountUnrealized,
