@@ -359,7 +359,8 @@ export class LighterGateway {
     const conversion = this.mapCreateOrderParams(params);
     const { baseAmountScaledString, priceScaledString, triggerPriceScaledString, ...signParams } = conversion;
 
-    const attemptCreate = async (): Promise<AsterOrder> => {
+    const maxAttempts = 3;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const { apiKeyIndex, nonce } = this.nonceManager.next();
       try {
         const signed = await this.signer.signCreateOrder({
@@ -401,21 +402,13 @@ export class LighterGateway {
         this.nonceManager.acknowledgeFailure(apiKeyIndex);
         if (isInvalidNonce(error)) {
           await this.nonceManager.refresh(apiKeyIndex).catch((err) => this.logger("nonce.refresh", err));
-          throw new Error("RETRY_INVALID_NONCE");
+          continue; // retry with freshly synced nonce
         }
         this.logger("createOrder", error);
         throw error;
       }
-    };
-
-    try {
-      return await attemptCreate();
-    } catch (error) {
-      if (error instanceof Error && error.message === "RETRY_INVALID_NONCE") {
-        return await attemptCreate();
-      }
-      throw error;
     }
+    throw new Error("Failed to create order after refreshing nonce");
   }
 
   async cancelOrder(params: { marketIndex?: number; orderId: number | string; apiKeyIndex?: number }): Promise<void> {
