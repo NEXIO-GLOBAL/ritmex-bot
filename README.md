@@ -1,5 +1,7 @@
 # ritmex-bot
 
+> For English users, please see [README_en.md](README_en.md).
+
 基于 Bun 的多交易所永续合约量化终端，内置趋势跟随（SMA30）、Guardian 防守与做市策略，支持快速恢复、实时行情订阅、日志追踪与 CLI 仪表盘。
 
 如果您希望获取优惠并支持本项目，请考虑使用以下注册链接：
@@ -14,7 +16,6 @@
 * [Apex 手续费优惠注册链接](https://join.omni.apex.exchange/SEA)
 
 ## 文档索引
-- [English README](README_en.md)
 - [简明上手指南（零基础）](simple-readme.md)
 - [基础网格策略使用教程](grid-trading.md)
 
