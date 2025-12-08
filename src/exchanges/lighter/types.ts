@@ -54,7 +54,10 @@ export interface LighterPosition {
 export interface LighterAccountDetails {
   collateral: string;
   available_balance?: string;
+  total_asset_value?: string;
+  cross_asset_value?: string;
   total_order_count?: number;
+  assets?: LighterAccountAsset[];
   positions?: LighterPosition[];
   status?: number;
   account_index: number;
@@ -62,6 +65,13 @@ export interface LighterAccountDetails {
   name?: string;
   description?: string;
   pending_order_count?: number;
+}
+
+export interface LighterAccountAsset {
+  symbol: string;
+  asset_id?: number;
+  balance: string | number;
+  locked_balance?: string | number;
 }
 
 export interface LighterAuthToken {
@@ -85,10 +95,12 @@ export interface LighterOrderBookSnapshot {
 export interface LighterMarketStats {
   market_id: number;
   index_price: string;
-  mark_price: string;
-  open_interest: string;
+  mark_price?: string;
+  mid_price?: string;
+  open_interest?: string;
   last_trade_price: string;
   symbol?: string;
+  market_type?: "perp" | "spot" | string;
   current_funding_rate?: string;
   funding_rate?: string;
   funding_timestamp?: number;
@@ -114,6 +126,9 @@ export interface LighterKline {
 export interface LighterOrderBookMetadata {
   symbol: string;
   market_id: number;
+  market_type?: "perp" | "spot" | string;
+  base_asset_id?: number;
+  quote_asset_id?: number;
   maker_fee: string;
   taker_fee: string;
   min_base_amount: string;

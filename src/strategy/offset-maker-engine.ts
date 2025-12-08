@@ -10,7 +10,7 @@ import type {
 import { formatPriceToString } from "../utils/math";
 import { createTradeLog } from "../logging/trade-log";
 import { isUnknownOrderError, isRateLimitError } from "../utils/errors";
-import { getPosition } from "../utils/strategy";
+import { getPosition, parseSymbolParts } from "../utils/strategy";
 import type { PositionSnapshot } from "../utils/strategy";
 import { computeDepthStats } from "../utils/depth";
 import { computePositionPnl } from "../utils/pnl";
@@ -43,6 +43,10 @@ export interface OffsetMakerEngineSnapshot extends MakerEngineSnapshot {
   depthImbalance: "balanced" | "buy_dominant" | "sell_dominant";
   skipBuySide: boolean;
   skipSellSide: boolean;
+  marketType?: "perp" | "spot";
+  baseAsset?: string | null;
+  quoteAsset?: string | null;
+  spotBalances?: { baseAvailable: number; quoteAvailable: number; baseWallet?: number } | null;
 }
 
 type MakerEvent = "update";
@@ -54,6 +58,8 @@ export class OffsetMakerEngine {
   private accountSnapshot: AsterAccountSnapshot | null = null;
   private depthSnapshot: AsterDepth | null = null;
   private tickerSnapshot: AsterTicker | null = null;
+  private lastKline: AsterKline | null = null;
+  private liveCandle: { startMs: number; open: number; close: number } | null = null;
   private openOrders: AsterOrder[] = [];
 
   private readonly locks: OrderLockMap = {};
@@ -66,7 +72,19 @@ export class OffsetMakerEngine {
   private readonly sessionVolume = new SessionVolumeTracker();
   private priceTick: number = 0.1;
   private qtyStep: number = 0.001;
+  private minBaseAmount: number | null = null;
+  private minQuoteAmount: number | null = null;
   private precisionSync: Promise<void> | null = null;
+  private marketType: "perp" | "spot" = "perp";
+  private baseAsset: string | null = null;
+  private quoteAsset: string | null = null;
+  private baseAssetId: number | null = null;
+  private quoteAssetId: number | null = null;
+  private spotEntryPrice: number | null = null;
+  private lastSpotWallet = 0;
+  private spotKlineUp: boolean | null = null;
+  private lastSpotBuyGuardLogged = false;
+  private lastSpotStopSkipped = false;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
@@ -106,6 +124,9 @@ export class OffsetMakerEngine {
     );
     this.priceTick = Math.max(1e-9, this.config.priceTick);
     this.qtyStep = Math.max(1e-9, this.qtyStep);
+    const parsedSymbols = parseSymbolParts(this.config.symbol);
+    this.baseAsset = parsedSymbols.base ?? null;
+    this.quoteAsset = parsedSymbols.quote ?? null;
     this.syncPrecision();
     // Debounce window defaults to 3x refresh interval, min 1s
     this.repriceDwellMs = Math.max(1000, this.config.refreshIntervalMs * 3);
@@ -146,11 +167,35 @@ export class OffsetMakerEngine {
       (snapshot) => {
         this.accountSnapshot = snapshot;
         this.feedStatus.account = true;
+        if (snapshot.marketType) {
+          this.marketType = snapshot.marketType;
+        }
+        const parsed = parseSymbolParts(this.config.symbol);
+        this.baseAsset = snapshot.baseAsset ?? this.baseAsset ?? parsed.base ?? null;
+        this.quoteAsset = snapshot.quoteAsset ?? this.quoteAsset ?? parsed.quote ?? null;
+        this.baseAssetId = snapshot.baseAssetId ?? this.baseAssetId;
+        this.quoteAssetId = snapshot.quoteAssetId ?? this.quoteAssetId;
         const totalUnrealized = Number(snapshot.totalUnrealizedProfit ?? "0");
         if (Number.isFinite(totalUnrealized)) {
           this.accountUnrealized = totalUnrealized;
         }
+        const balances = this.getSpotBalances(snapshot);
+        if (snapshot.marketType === "spot" || this.marketType === "spot") {
+          const baseWallet = balances?.baseWallet ?? 0;
+          if (baseWallet < EPS) {
+            this.spotEntryPrice = null;
+          } else if (baseWallet > this.lastSpotWallet + EPS) {
+            const ref = this.getReferencePrice();
+            if (Number.isFinite(ref)) {
+              this.spotEntryPrice = Number(ref);
+            }
+          }
+          this.lastSpotWallet = baseWallet;
+        }
         const position = getPosition(snapshot, this.config.symbol);
+        if (this.marketType === "spot" && this.spotEntryPrice != null) {
+          position.entryPrice = this.spotEntryPrice;
+        }
         this.sessionVolume.update(position, this.getReferencePrice());
         this.emitUpdate();
       },
@@ -215,8 +260,15 @@ export class OffsetMakerEngine {
 
     safeSubscribe<AsterKline[]>(
       this.exchange.watchKlines.bind(this.exchange, this.config.symbol, "1m"),
-      (_klines) => {
-        /* no-op */
+      (klines) => {
+        if (!Array.isArray(klines) || !klines.length) return;
+        const latest = klines[klines.length - 1];
+        this.lastKline = latest;
+        const open = Number(latest.open);
+        const close = Number(latest.close);
+        if (Number.isFinite(open) && Number.isFinite(close)) {
+          this.spotKlineUp = close > open;
+        }
       },
       log,
       {
@@ -279,7 +331,11 @@ export class OffsetMakerEngine {
       this.lastSkipSell = skipSellSide;
       this.lastImbalance = imbalance;
 
-      const position = getPosition(this.accountSnapshot, this.config.symbol);
+      const position = this.getPositionSnapshot();
+      const isSpotMarket = this.marketType === "spot";
+      const spotBalances = isSpotMarket ? this.getSpotBalances() : null;
+      const balancesForSpot = isSpotMarket ? spotBalances ?? { baseAvailable: 0, quoteAvailable: 0 } : spotBalances;
+      this.updateLiveCandle();
       const handledImbalance = await this.handleImbalanceExit(position, buySum, sellSum);
       if (handledImbalance) {
         this.emitUpdate();
@@ -302,34 +358,141 @@ export class OffsetMakerEngine {
       const safeAsk = this.ensureMakerPrice("SELL", rawAskPrice, finalBid, finalAsk);
       const bidPrice = safeBid != null ? formatPriceToString(safeBid, priceDecimals) : null;
       const askPrice = safeAsk != null ? formatPriceToString(safeAsk, priceDecimals) : null;
-      const absPosition = Math.abs(position.positionAmt);
+      const rawAbsPosition = Math.abs(position.positionAmt);
+      const minSell =
+        Number.isFinite(this.minBaseAmount) && this.minBaseAmount! > 0
+          ? this.minBaseAmount!
+          : Math.max(this.config.tradeAmount, this.qtyStep);
+      let absPosition = rawAbsPosition;
+      const tinySpotPosition =
+        isSpotMarket &&
+        minSell > 0 &&
+        rawAbsPosition > EPS &&
+        rawAbsPosition + EPS < minSell;
+      if (tinySpotPosition) {
+        absPosition = 0; // treat as flat to allow buys to accumulate until reaching minimum sell size
+      }
       const desired: DesiredOrder[] = [];
       const canEnter = !this.rateLimit.shouldBlockEntries();
+      const allowSpotBuy = !isSpotMarket || this.isSpotKlineUp();
 
-      if (absPosition < EPS) {
+      if (absPosition < EPS && isSpotMarket) {
         this.entryPricePendingLogged = false;
+        const baseAvail = balancesForSpot?.baseAvailable ?? 0;
+        const baseWallet = balancesForSpot?.baseWallet ?? baseAvail;
+        const maxBase = Math.max(baseAvail, baseWallet);
+        if (isSpotMarket && minSell > 0 && maxBase + EPS < minSell) {
+          // 无法卖出，跳过卖单，允许买单累计
+          this.lastSellPriceViable = false;
+          if (!skipSellSide) {
+            this.tradeLog.push("info", "现货持仓低于最小卖单量，暂不挂卖单");
+          }
+        }
         if (!skipBuySide && canEnter) {
-          if (bidPrice != null) {
-            this.lastBuyPriceViable = true;
-            desired.push({ side: "BUY", price: bidPrice, amount: this.config.tradeAmount, reduceOnly: false });
-          } else if (this.lastBuyPriceViable) {
-            this.lastBuyPriceViable = false;
-            this.tradeLog.push("info", "跳过买单：价差不足以构造maker价格");
+          if (!allowSpotBuy) {
+            if (this.lastBuyPriceViable) {
+              this.tradeLog.push("info", "现货买入仅在1m阳线，当前跳过买单");
+              this.lastBuyPriceViable = false;
+            }
+          } else {
+            const buyAmount = this.computeSpotOrderSize({
+              side: "BUY",
+              desiredAmount: this.config.tradeAmount,
+              price: bidPrice != null ? Number(bidPrice) : null,
+              balances: balancesForSpot,
+            });
+            if (bidPrice != null && buyAmount >= EPS) {
+              this.lastBuyPriceViable = true;
+              desired.push({ side: "BUY", price: bidPrice, amount: buyAmount, reduceOnly: false });
+            } else if (this.lastBuyPriceViable) {
+              this.lastBuyPriceViable = false;
+              const reason =
+                buyAmount < EPS && isSpotMarket
+                  ? "现货可用报价资产不足，跳过买单"
+                  : "跳过买单：价差不足以构造maker价格";
+              this.tradeLog.push("info", reason);
+            }
           }
         }
         if (!skipSellSide && canEnter) {
-          if (askPrice != null) {
-            this.lastSellPriceViable = true;
-            desired.push({ side: "SELL", price: askPrice, amount: this.config.tradeAmount, reduceOnly: false });
-          } else if (this.lastSellPriceViable) {
-            this.lastSellPriceViable = false;
-            this.tradeLog.push("info", "跳过卖单：价差不足以构造maker价格");
+          const baseAvail = balancesForSpot?.baseAvailable ?? 0;
+          const baseWallet = balancesForSpot?.baseWallet ?? baseAvail;
+          const maxBase = Math.max(baseAvail, baseWallet);
+          if (isSpotMarket && minSell > 0 && maxBase + EPS < minSell) {
+            // 持仓低于最小卖单量，跳过卖单，等待累积
+            if (this.lastSellPriceViable) {
+              this.lastSellPriceViable = false;
+              this.tradeLog.push("info", "现货持仓低于最小卖单量，跳过卖单");
+            }
+          } else {
+            const desiredSellAmount =
+              isSpotMarket && balancesForSpot ? balancesForSpot.baseAvailable : this.config.tradeAmount;
+            const sellAmount = this.computeSpotOrderSize({
+              side: "SELL",
+              desiredAmount: desiredSellAmount,
+              price: askPrice != null ? Number(askPrice) : null,
+              balances: balancesForSpot,
+            });
+            if (askPrice != null && sellAmount >= EPS) {
+              this.lastSellPriceViable = true;
+              desired.push({ side: "SELL", price: askPrice, amount: sellAmount, reduceOnly: false });
+            } else if (this.lastSellPriceViable) {
+              this.lastSellPriceViable = false;
+              const reason =
+                sellAmount < EPS && isSpotMarket
+                  ? "现货可用基础资产不足，跳过卖单"
+                  : "跳过卖单：价差不足以构造maker价格";
+              this.tradeLog.push("info", reason);
+            }
           }
+        }
+      } else if (absPosition < EPS) {
+        this.entryPricePendingLogged = false;
+        if (!skipBuySide && canEnter) {
+          if (isSpotMarket && !allowSpotBuy) {
+            if (this.lastBuyPriceViable) {
+              this.tradeLog.push("info", "现货买入仅在1m阳线，当前跳过买单");
+              this.lastBuyPriceViable = false;
+            }
+          } else {
+            desired.push({ side: "BUY", price: bidPrice, amount: this.config.tradeAmount, reduceOnly: false });
+          }
+        }
+        if (!skipSellSide && canEnter) {
+          if (isSpotMarket && minSell > 0 && this.minBaseAmount != null) {
+            const baseAvail = balancesForSpot?.baseAvailable ?? 0;
+            const baseWallet = balancesForSpot?.baseWallet ?? baseAvail;
+            if (Math.max(baseAvail, baseWallet) + EPS < minSell) {
+              this.lastSellPriceViable = false;
+              this.tradeLog.push("info", "现货持仓低于最小卖单量，跳过卖单");
+            }
+          }
+          desired.push({ side: "SELL", price: askPrice, amount: this.config.tradeAmount, reduceOnly: false });
         }
       } else {
         const closeSide: "BUY" | "SELL" = position.positionAmt > 0 ? "SELL" : "BUY";
         const closePrice = closeSide === "SELL" ? closeAskPrice : closeBidPrice;
-        desired.push({ side: closeSide, price: closePrice, amount: absPosition, reduceOnly: true });
+        if (isSpotMarket && minSell > 0 && rawAbsPosition + EPS < minSell) {
+          // 持仓未达最小卖出量，等待累积，不下单
+          this.lastSellPriceViable = false;
+          this.lastBuyPriceViable = false;
+          this.desiredOrders = [];
+          this.sessionVolume.update(position, this.getReferencePrice());
+          this.emitUpdate();
+          return;
+        }
+        const closeQty =
+          isSpotMarket && balancesForSpot
+            ? this.computeSpotOrderSize({
+                side: "SELL",
+                desiredAmount: rawAbsPosition,
+                price: closePrice != null ? Number(closePrice) : null,
+                balances: balancesForSpot,
+              })
+            : rawAbsPosition;
+        if (closePrice != null && closeQty >= EPS) {
+          desired.push({ side: closeSide, price: closePrice, amount: closeQty, reduceOnly: false });
+        }
       }
 
       this.desiredOrders = desired;
@@ -354,7 +517,8 @@ export class OffsetMakerEngine {
   }
 
   private async enforceRateLimitStop(): Promise<void> {
-    const position = getPosition(this.accountSnapshot, this.config.symbol);
+    if (this.marketType === "spot") return;
+    const position = this.getPositionSnapshot();
     if (Math.abs(position.positionAmt) < EPS) return;
     await this.flushOrders();
     const absPosition = Math.abs(position.positionAmt);
@@ -438,6 +602,7 @@ export class OffsetMakerEngine {
     buySum: number,
     sellSum: number
   ): Promise<boolean> {
+    if (this.marketType === "spot") return false;
     const absPosition = Math.abs(position.positionAmt);
     if (absPosition < EPS) return false;
 
@@ -547,7 +712,21 @@ export class OffsetMakerEngine {
     for (const target of toPlace) {
       if (!target) continue;
       if (target.amount < EPS) continue;
+      if (
+        this.marketType === "spot" &&
+        this.minBaseAmount != null &&
+        target.side === "SELL" &&
+        target.amount + EPS < this.minBaseAmount
+      ) {
+        // Skip placing sells that would be bumped by venue minimums
+        if (this.lastSellPriceViable) {
+          this.lastSellPriceViable = false;
+          this.tradeLog.push("info", "现货卖单低于最小成交量，跳过挂单等待累积");
+        }
+        continue;
+      }
       try {
+        const reduceOnlyFlag = this.marketType === "spot" ? false : target.reduceOnly;
         await placeOrder(
           this.exchange,
           this.config.symbol,
@@ -559,9 +738,9 @@ export class OffsetMakerEngine {
           target.price, // 已经是字符串价格
           target.amount,
           (type, detail) => this.tradeLog.push(type, detail),
-          target.reduceOnly,
+          reduceOnlyFlag,
           {
-            markPrice: getPosition(this.accountSnapshot, this.config.symbol).markPrice,
+            markPrice: this.getPositionSnapshot().markPrice,
             maxPct: this.config.maxCloseSlippagePct,
           },
           {
@@ -593,6 +772,57 @@ export class OffsetMakerEngine {
   }
 
   private async checkRisk(position: PositionSnapshot, bidPrice: number, askPrice: number): Promise<void> {
+    // For spot: use balance-derived size; if loss exceeds threshold, market sell to exit.
+    if (this.marketType === "spot") {
+      const absPosition = Math.abs(position.positionAmt);
+      if (absPosition < EPS) {
+        this.lastSpotStopSkipped = false;
+        return;
+      }
+      const minStopQty = Number.isFinite(this.minBaseAmount) ? this.minBaseAmount! : null;
+      if (minStopQty != null && minStopQty > 0 && absPosition + EPS < minStopQty) {
+        if (!this.lastSpotStopSkipped) {
+          this.tradeLog.push("info", "现货持仓低于最小平仓数量，跳过止损检查");
+          this.lastSpotStopSkipped = true;
+        }
+        return;
+      }
+      this.lastSpotStopSkipped = false;
+      const pnl = computePositionPnl(position, bidPrice, askPrice);
+      const triggerStop = shouldStopLoss(position, bidPrice, askPrice, this.config.lossLimit);
+      if (!triggerStop) return;
+      this.tradeLog.push("stop", `现货止损，当前仓位=${absPosition.toFixed(6)} PnL=${pnl.toFixed(4)} USDT`);
+      try {
+        // 尽力撤销所有未完成挂单，避免锁定基础资产导致余额不足
+        await this.exchange.cancelAllOrders({ symbol: this.config.symbol }).catch(() => {});
+        await this.flushOrders();
+        await marketClose(
+          this.exchange,
+          this.config.symbol,
+          this.openOrders,
+          this.locks,
+          this.timers,
+          this.pending,
+          "SELL",
+          absPosition,
+          (type, detail) => this.tradeLog.push(type, detail),
+          {
+            markPrice: position.markPrice,
+            expectedPrice: bidPrice || null,
+            maxPct: this.config.maxCloseSlippagePct,
+          },
+          { qtyStep: this.qtyStep }
+        );
+      } catch (error) {
+        if (isRateLimitError(error)) throw error;
+        if (isUnknownOrderError(error)) {
+          this.tradeLog.push("order", "止损平仓时订单已不存在");
+        } else {
+          this.tradeLog.push("error", `现货止损失败: ${String(error)}`);
+        }
+      }
+      return;
+    }
     const absPosition = Math.abs(position.positionAmt);
     if (absPosition < EPS) return;
 
@@ -691,6 +921,12 @@ export class OffsetMakerEngine {
             updated = true;
           }
         }
+        if (Number.isFinite(precision.minBaseAmount)) {
+          this.minBaseAmount = precision.minBaseAmount!;
+        }
+        if (Number.isFinite(precision.minQuoteAmount)) {
+          this.minQuoteAmount = precision.minQuoteAmount!;
+        }
         if (updated) {
           this.tradeLog.push(
             "info",
@@ -724,7 +960,7 @@ export class OffsetMakerEngine {
   }
 
   private buildSnapshot(): OffsetMakerEngineSnapshot {
-    const position = getPosition(this.accountSnapshot, this.config.symbol);
+    const position = this.getPositionSnapshot();
     const { topBid, topAsk } = getTopPrices(this.depthSnapshot);
     const spread = topBid != null && topAsk != null ? topAsk - topBid : null;
     const pnl = computePositionPnl(position, topBid, topAsk);
@@ -750,11 +986,107 @@ export class OffsetMakerEngine {
       depthImbalance: this.lastImbalance,
       skipBuySide: this.lastSkipBuy,
       skipSellSide: this.lastSkipSell,
+      marketType: this.marketType,
+      baseAsset: this.baseAsset,
+      quoteAsset: this.quoteAsset,
+      spotBalances: this.marketType === "spot" ? this.getSpotBalances() : null,
     };
   }
 
   private getReferencePrice(): number | null {
     return getMidOrLast(this.depthSnapshot, this.tickerSnapshot);
+  }
+
+  private isSpotKlineUp(): boolean {
+    return this.spotKlineUp === true || this.isLiveCandleUp();
+  }
+
+  private isLiveCandleUp(): boolean {
+    if (!this.liveCandle) return false;
+    return this.liveCandle.close > this.liveCandle.open;
+  }
+
+  private updateLiveCandle(): void {
+    const price = this.getReferencePrice();
+    if (!Number.isFinite(price)) return;
+    const now = Date.now();
+    const minuteStart = now - (now % 60000);
+    if (!this.liveCandle || this.liveCandle.startMs !== minuteStart) {
+      this.liveCandle = { startMs: minuteStart, open: price as number, close: price as number };
+    } else {
+      this.liveCandle.close = price as number;
+    }
+    this.spotKlineUp = this.isLiveCandleUp();
+  }
+
+  private getPositionSnapshot(): PositionSnapshot {
+    const position = getPosition(this.accountSnapshot, this.config.symbol);
+    if (this.marketType === "spot" && this.spotEntryPrice != null && Math.abs(position.positionAmt) > EPS) {
+      return { ...position, entryPrice: this.spotEntryPrice };
+    }
+    return position;
+  }
+
+  private getSpotBalances(snapshot: AsterAccountSnapshot | null = this.accountSnapshot): { baseAvailable: number; quoteAvailable: number; baseWallet: number } | null {
+    const assets = snapshot?.assets ?? [];
+    if (!assets.length) return null;
+    const parsed = parseSymbolParts(this.config.symbol);
+    const baseSymbol = (this.baseAsset ?? snapshot?.baseAsset ?? parsed.base ?? "").toUpperCase();
+    const quoteSymbol = (this.quoteAsset ?? snapshot?.quoteAsset ?? parsed.quote ?? "").toUpperCase();
+    const baseId = snapshot?.baseAssetId ?? this.baseAssetId ?? null;
+    const quoteId = snapshot?.quoteAssetId ?? this.quoteAssetId ?? null;
+    const normalize = (asset?: string) => (asset ? asset.toUpperCase() : "");
+    const pickAvailable = (asset?: { availableBalance?: string; walletBalance: string }) => {
+      const available = Number(asset?.availableBalance ?? asset?.walletBalance ?? 0);
+      return Number.isFinite(available) ? available : 0;
+    };
+    const pickWallet = (asset?: { walletBalance: string }) => {
+      const wallet = Number(asset?.walletBalance ?? 0);
+      return Number.isFinite(wallet) ? wallet : 0;
+    };
+    const baseAssetEntry = assets.find(
+      (asset) =>
+        (Number.isFinite(baseId) && Number(asset.assetId) === Number(baseId)) ||
+        normalize(asset.asset) === baseSymbol
+    );
+    const quoteAssetEntry = assets.find(
+      (asset) =>
+        (Number.isFinite(quoteId) && Number(asset.assetId) === Number(quoteId)) ||
+        normalize(asset.asset) === quoteSymbol
+    );
+    return {
+      baseAvailable: pickAvailable(baseAssetEntry),
+      quoteAvailable: pickAvailable(quoteAssetEntry),
+      baseWallet: pickWallet(baseAssetEntry),
+    };
+  }
+
+  private computeSpotOrderSize(params: {
+    side: "BUY" | "SELL";
+    desiredAmount: number;
+    price: number | null;
+    balances: { baseAvailable: number; quoteAvailable: number; baseWallet?: number } | null;
+  }): number {
+    const desired = Number(params.desiredAmount);
+    if (!Number.isFinite(desired) || desired <= 0) return 0;
+    if (!params.balances) return desired;
+    if (params.side === "SELL") {
+      const cap = Math.max(0, params.balances.baseAvailable, params.balances.baseWallet ?? 0);
+      if (this.minBaseAmount != null && cap + EPS < this.minBaseAmount) {
+        return 0; // below venue min trade size; skip sell until enough balance
+      }
+      return this.roundToStep(Math.max(0, Math.min(desired, cap)));
+    }
+    const price = Number(params.price);
+    const quoteAvailable = Math.max(0, params.balances.quoteAvailable ?? 0);
+    if (!Number.isFinite(price) || price <= 0) return desired;
+    const maxByQuote = quoteAvailable / price;
+    return this.roundToStep(Math.max(0, Math.min(desired, maxByQuote)));
+  }
+
+  private roundToStep(amount: number): number {
+    const step = Math.max(1e-9, this.qtyStep);
+    return Math.floor(amount / step) * step;
   }
 
   private ensureMakerPrice(
@@ -797,7 +1129,7 @@ export class OffsetMakerEngine {
   private async tryDustMarketClose(target: DesiredOrder, error: unknown): Promise<boolean> {
     if (!target.reduceOnly) return false;
     if (!this.isInvalidAmountError(error)) return false;
-    const position = getPosition(this.accountSnapshot, this.config.symbol);
+    const position = this.getPositionSnapshot();
     const absQty = Math.abs(target.amount);
     if (absQty < EPS) return false;
     const { topBid, topAsk } = getTopPrices(this.depthSnapshot);

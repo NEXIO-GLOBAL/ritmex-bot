@@ -1,4 +1,4 @@
-import type { AsterAccountSnapshot, AsterKline } from "../exchanges/types";
+import type { AsterAccountAsset, AsterAccountSnapshot, AsterKline } from "../exchanges/types";
 
 export interface PositionSnapshot {
   positionAmt: number;
@@ -11,6 +11,22 @@ export function getPosition(snapshot: AsterAccountSnapshot | null, symbol: strin
   if (!snapshot) {
     return { positionAmt: 0, entryPrice: 0, unrealizedProfit: 0, markPrice: null };
   }
+  // For spot, derive position strictly from asset balances to avoid WS-cleared positions.
+  if (snapshot.marketType === "spot") {
+    const baseSymbol =
+      normalizeBaseSymbol(snapshot.baseAsset) ?? parseSymbolParts(symbol).base ?? normalizeBaseSymbol(symbol);
+    if (baseSymbol) {
+      const asset = selectAsset(snapshot.assets ?? [], baseSymbol, snapshot.baseAssetId);
+      const amt = Number(asset?.walletBalance ?? 0);
+      const available = Number(asset?.availableBalance ?? asset?.walletBalance ?? 0);
+      const size = Number.isFinite(amt) && amt > 0 ? amt : Number.isFinite(available) ? Math.max(0, available) : 0;
+      if (size > 0) {
+        return { positionAmt: size, entryPrice: 0, unrealizedProfit: 0, markPrice: null };
+      }
+    }
+    return { positionAmt: 0, entryPrice: 0, unrealizedProfit: 0, markPrice: null };
+  }
+
   const positions = snapshot.positions?.filter((p) => p.symbol === symbol) ?? [];
   if (positions.length === 0) {
     return { positionAmt: 0, entryPrice: 0, unrealizedProfit: 0, markPrice: null };
@@ -111,4 +127,34 @@ export function isOrderPriceAllowedByMark(params: {
     return price <= mark * (1 + Math.max(0, maxPct));
   }
   return price >= mark * (1 - Math.max(0, maxPct));
+}
+
+export function parseSymbolParts(symbol: string | undefined): { base?: string; quote?: string } {
+  const normalized = (symbol ?? "").toUpperCase();
+  if (!normalized) return {};
+  const delimiters = ["/", "-", ":"];
+  for (const delimiter of delimiters) {
+    if (normalized.includes(delimiter)) {
+      const [base, quote] = normalized.split(delimiter);
+      return { base: base || undefined, quote: quote || undefined };
+    }
+  }
+  if (normalized.length >= 6) {
+    return { base: normalized.slice(0, 3), quote: normalized.slice(3) };
+  }
+  return { base: normalized };
+}
+
+function normalizeBaseSymbol(symbol: string | undefined): string | undefined {
+  return parseSymbolParts(symbol).base;
+}
+
+function selectAsset(assets: AsterAccountAsset[], baseSymbol: string, baseAssetId?: number): AsterAccountAsset | undefined {
+  const normalized = baseSymbol.toUpperCase();
+  const targetId = Number(baseAssetId);
+  return assets.find((asset) => {
+    const matchesId = Number.isFinite(targetId) && Number(asset.assetId) === targetId;
+    const matchesSymbol = normalizeBaseSymbol(asset.asset) === normalized;
+    return matchesId || matchesSymbol;
+  });
 }

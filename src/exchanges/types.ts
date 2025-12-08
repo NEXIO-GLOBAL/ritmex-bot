@@ -256,6 +256,7 @@ export interface AsterAccountAsset {
   walletBalance: string;
   availableBalance: string;
   updateTime: number;
+  assetId?: number;
   unrealizedProfit?: string;
   marginBalance?: string;
   maintMargin?: string;
@@ -286,6 +287,11 @@ export interface AsterAccountSnapshot {
   maxWithdrawAmount?: string;
   positions: AsterAccountPosition[];
   assets: AsterAccountAsset[];
+  marketType?: "perp" | "spot";
+  baseAsset?: string;
+  quoteAsset?: string;
+  baseAssetId?: number;
+  quoteAssetId?: number;
 }
 
 export interface AsterDepthLevel extends Array<string> {

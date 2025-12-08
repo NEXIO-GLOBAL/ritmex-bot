@@ -33,6 +33,8 @@ export interface ExchangePrecision {
   priceDecimals?: number;
   sizeDecimals?: number;
   marketId?: number;
+  minBaseAmount?: number;
+  minQuoteAmount?: number;
 }
 
 export interface ExchangeAdapter {

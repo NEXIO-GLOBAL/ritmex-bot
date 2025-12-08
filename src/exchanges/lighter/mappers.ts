@@ -48,7 +48,7 @@ export function toTicker(symbol: string, stats: LighterMarketStats): AsterTicker
     volume: stats.daily_base_token_volume != null ? String(stats.daily_base_token_volume) : "0",
     quoteVolume: stats.daily_quote_token_volume != null ? String(stats.daily_quote_token_volume) : "0",
     priceChange: stats.daily_price_change != null ? String(stats.daily_price_change) : undefined,
-    markPrice: undefined,
+    markPrice: stats.mid_price ?? stats.mark_price ?? stats.index_price,
     weightedAvgPrice: undefined,
   } as AsterTicker;
 }
@@ -163,7 +163,15 @@ export function toAccountSnapshot(
   details: LighterAccountDetails,
   positions: LighterPosition[] = [],
   assets: AsterAccountAsset[] = [],
-  options?: { marketSymbol?: string | null; marketId?: number | null }
+  options?: {
+    marketSymbol?: string | null;
+    marketId?: number | null;
+    marketType?: string | null;
+    baseAssetSymbol?: string | null;
+    quoteAssetSymbol?: string | null;
+    baseAssetId?: number | null;
+    quoteAssetId?: number | null;
+  }
 ): AsterAccountSnapshot {
   const targetSymbol = options?.marketSymbol ?? null;
   const targetMarketId =
@@ -184,29 +192,73 @@ export function toAccountSnapshot(
     return true;
   });
   const transformedPositions = filteredPositions.map((position) => lighterPositionToAster(symbol, position));
+  if (!transformedPositions.length && normalizeMarketType(options?.marketType) === "spot") {
+    const baseSymbol = options?.baseAssetSymbol ?? options?.marketSymbol ?? symbol;
+    const baseAsset = findAsset(assets, baseSymbol);
+    const baseSize = Number(baseAsset?.walletBalance ?? 0);
+    if (Number.isFinite(baseSize) && baseSize > 0) {
+      transformedPositions.push({
+        symbol,
+        positionAmt: baseSize.toString(),
+        entryPrice: "0",
+        unrealizedProfit: "0",
+        positionSide: "BOTH",
+        updateTime: Date.now(),
+      });
+    }
+  }
   const aggregateUnrealized = transformedPositions.reduce((acc, pos) => acc + Number(pos.unrealizedProfit ?? 0), 0);
-  const assetList = assets.length ? assets : defaultAsset(details);
+  const assetList = assets.length ? assets : defaultAsset(details, options?.quoteAssetSymbol ?? "USDC");
+  const totalWallet = computeTotalWalletBalance(assetList, details);
   return {
     canTrade: details.status !== 0,
     canDeposit: true,
     canWithdraw: true,
     updateTime: Date.now(),
-    totalWalletBalance: details.collateral ?? "0",
+    totalWalletBalance: totalWallet,
+    availableBalance: details.available_balance ?? undefined,
     totalUnrealizedProfit: aggregateUnrealized.toFixed(8),
     positions: transformedPositions,
     assets: assetList,
+    marketType: normalizeMarketType(options?.marketType),
+    baseAsset: options?.baseAssetSymbol ?? undefined,
+    quoteAsset: options?.quoteAssetSymbol ?? undefined,
+    baseAssetId: options?.baseAssetId ?? undefined,
+    quoteAssetId: options?.quoteAssetId ?? undefined,
   };
 }
 
-function defaultAsset(details: LighterAccountDetails): AsterAccountAsset[] {
+function defaultAsset(details: LighterAccountDetails, quoteAsset: string): AsterAccountAsset[] {
   return [
     {
-      asset: "USDC",
+      asset: quoteAsset || "USDC",
       walletBalance: details.collateral ?? "0",
       availableBalance: details.available_balance ?? details.collateral ?? "0",
       updateTime: Date.now(),
     },
   ];
+}
+
+function computeTotalWalletBalance(assets: AsterAccountAsset[], details: LighterAccountDetails): string {
+  const sum = assets.reduce((acc, asset) => acc + Number(asset.walletBalance ?? 0), 0);
+  if (Number.isFinite(sum) && sum > 0) {
+    return sum.toString();
+  }
+  return details.total_asset_value ?? details.collateral ?? "0";
+}
+
+function findAsset(assets: AsterAccountAsset[], target: string | undefined | null): AsterAccountAsset | undefined {
+  if (!target) return undefined;
+  const normalizedTarget = target.toUpperCase().split(/[-:/]/)[0];
+  return assets.find((asset) => asset.asset.toUpperCase().split(/[-:/]/)[0] === normalizedTarget);
+}
+
+function normalizeMarketType(value: string | null | undefined): "perp" | "spot" | undefined {
+  if (!value) return undefined;
+  const normalized = value.toLowerCase();
+  if (normalized === "spot") return "spot";
+  if (normalized === "perp" || normalized === "perpetual" || normalized === "futures") return "perp";
+  return undefined;
 }
 
 function lighterPositionToAster(symbol: string, position: LighterPosition): AsterAccountPosition {
