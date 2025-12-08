@@ -4,6 +4,8 @@
 
 Please set `LANG=en` in `.env` for English interface.
 
+A Bun-powered multi-exchange perpetuals workstation that ships an SMA30 trend engine, a Guardian stop sentinel, and two market-making modes. It offers instant restarts, realtime market data, structured logging, and an Ink-based CLI dashboard.
+
 基于 Bun 的多交易所永续合约量化终端，内置趋势跟随（SMA30）、Guardian 防守与做市策略，支持快速恢复、实时行情订阅、日志追踪与 CLI 仪表盘。
 
 如果您希望获取优惠并支持本项目，请考虑使用以下注册链接：
