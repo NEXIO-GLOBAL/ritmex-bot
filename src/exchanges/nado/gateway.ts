@@ -1275,13 +1275,14 @@ export class NadoGateway {
       const origQty = fromX18(new BigNumber(order.amountX18).abs()).toFixed();
       const remaining = fromX18(new BigNumber(order.unfilledAmountX18).abs()).toFixed();
       const executed = new BigNumber(origQty).minus(remaining);
+      const status = executed.isFinite() && executed.gt(0) ? "PARTIALLY_FILLED" : "NEW";
       orders.push({
         orderId: order.digest,
         clientOrderId: order.clientId != null ? String(order.clientId) : order.digest,
         symbol: displaySymbol,
         side,
         type,
-        status: "NEW",
+        status,
         price: fromX18(order.priceX18).toFixed(),
         origQty,
         executedQty: executed.isFinite() ? executed.toFixed() : "0",

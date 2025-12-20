@@ -10,6 +10,7 @@ import type {
 import { formatPriceToString } from "../utils/math";
 import { createTradeLog, type TradeLogEntry } from "../logging/trade-log";
 import { extractMessage, isInsufficientBalanceError, isUnknownOrderError, isRateLimitError } from "../utils/errors";
+import { isOrderActiveStatus } from "../utils/order-status";
 import { getPosition } from "../utils/strategy";
 import type { PositionSnapshot } from "../utils/strategy";
 import { computePositionPnl } from "../utils/pnl";
@@ -183,7 +184,12 @@ export class MakerEngine {
       (orders) => {
         this.syncLocksWithOrders(orders);
         this.openOrders = Array.isArray(orders)
-          ? orders.filter((order) => order.type !== "MARKET" && order.symbol === this.config.symbol)
+          ? orders.filter(
+              (order) =>
+                order.type !== "MARKET" &&
+                order.symbol === this.config.symbol &&
+                isOrderActiveStatus(order.status)
+            )
           : [];
         const currentIds = new Set(this.openOrders.map((order) => String(order.orderId)));
         for (const id of Array.from(this.pendingCancelOrders)) {
@@ -386,10 +392,7 @@ export class MakerEngine {
 
   private async syncOrders(targets: DesiredOrder[]): Promise<void> {
     const availableOrders = this.openOrders.filter((o) => !this.pendingCancelOrders.has(String(o.orderId)));
-    const openOrders = availableOrders.filter((order) => {
-      const status = (order.status ?? "").toUpperCase();
-      return !status.includes("CLOSED") && !status.includes("FILLED") && !status.includes("CANCELED");
-    });
+    const openOrders = availableOrders.filter((order) => isOrderActiveStatus(order.status));
     const { toCancel, toPlace } = makeOrderPlan(openOrders, targets);
 
     for (const order of toCancel) {

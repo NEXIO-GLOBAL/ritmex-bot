@@ -10,6 +10,7 @@ import type {
 import { formatPriceToString } from "../utils/math";
 import { createTradeLog } from "../logging/trade-log";
 import { isUnknownOrderError, isRateLimitError } from "../utils/errors";
+import { isOrderActiveStatus } from "../utils/order-status";
 import { getPosition, parseSymbolParts } from "../utils/strategy";
 import type { PositionSnapshot } from "../utils/strategy";
 import { computeDepthStats } from "../utils/depth";
@@ -212,7 +213,12 @@ export class OffsetMakerEngine {
         this.syncLocksWithOrders(orders);
         this.feedStatus.orders = true;
         this.openOrders = Array.isArray(orders)
-          ? orders.filter((order) => order.type !== "MARKET" && order.symbol === this.config.symbol)
+          ? orders.filter(
+              (order) =>
+                order.type !== "MARKET" &&
+                order.symbol === this.config.symbol &&
+                isOrderActiveStatus(order.status)
+            )
           : [];
         const currentIds = new Set(this.openOrders.map((order) => String(order.orderId)));
         for (const id of Array.from(this.pendingCancelOrders)) {
@@ -650,10 +656,7 @@ export class OffsetMakerEngine {
 
   private async syncOrders(targets: DesiredOrder[]): Promise<void> {
     const availableOrders = this.openOrders.filter((o) => !this.pendingCancelOrders.has(String(o.orderId)));
-    const openOrders = availableOrders.filter((order) => {
-      const status = (order.status ?? "").toUpperCase();
-      return !status.includes("CLOSED") && !status.includes("FILLED") && !status.includes("CANCELED");
-    });
+    const openOrders = availableOrders.filter((order) => isOrderActiveStatus(order.status));
 
     // Coalesce reprices for entry orders: if within tick threshold or within dwell window, keep existing order
     const adjustedTargets: DesiredOrder[] = targets.map((t) => ({ ...t }));

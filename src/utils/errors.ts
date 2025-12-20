@@ -1,4 +1,10 @@
 export function isUnknownOrderError(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = Number((error as { code?: unknown }).code);
+    // Nado: 2020: Order with the provided digest ... could not be found.
+    if (Number.isFinite(code) && code === 2020) return true;
+  }
   const message = extractMessage(error);
   if (!message) return false;
   const upper = message.toUpperCase();
@@ -7,7 +13,9 @@ export function isUnknownOrderError(error: unknown): boolean {
     upper.includes("CODE\":-2011") ||
     upper.includes("ORDER_ID_NOT_FOUND") ||
     upper.includes("ORDER_IS_CLOSED") ||
-    upper.includes("COULD NOT FIND ORDER")
+    upper.includes("COULD NOT FIND ORDER") ||
+    upper.includes("ORDER WITH THE PROVIDED DIGEST") ||
+    (upper.includes("COULD NOT BE FOUND") && upper.includes("ORDER"))
   );
 }
 
